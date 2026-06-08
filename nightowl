@@ -1,0 +1,1339 @@
+#!/usr/bin/env python3
+"""
+nightowl - HTB/CTF Post-Exploitation Enumeration Tool
+Author: For HTB/CTF use only — authorized systems only.
+
+Usage:
+    ./nightowl [options]
+    ./nightowl --all
+    ./nightowl --users --sudo --suid
+"""
+
+import os
+import sys
+import subprocess
+import platform
+import argparse
+import socket
+import stat
+import pwd
+import grp
+import re
+from datetime import datetime
+from pathlib import Path
+from shutil import which
+
+
+# ─────────────────────────────────────────────
+#  ANSI Colors
+# ─────────────────────────────────────────────
+class C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    CYAN    = "\033[96m"
+    MAGENTA = "\033[95m"
+    GREY    = "\033[90m"
+    WHITE   = "\033[97m"
+
+VERSION = "1.0"
+AUTHOR  = "N4pC47xD"
+
+def banner():
+    print(f"""
+{C.WHITE}    ,___,
+    {C.RED}[O.O]{C.WHITE}   {C.BOLD}{C.RED}N I G H T O W L{C.RESET}
+{C.WHITE}    /)  (\\  {C.GREY}─────────────────────────────────{C.RESET}
+{C.WHITE}  -"--  --"-  {C.GREY}Post-Exploitation Enumerator{C.RESET}
+{C.GREY}               version {VERSION}  //  author {AUTHOR}{C.RESET}
+{C.GREY}               authorized systems only{C.RESET}
+""")
+
+def section(title: str):
+    width = 60
+    print(f"\n{C.CYAN}{C.BOLD}{'═' * width}{C.RESET}")
+    print(f"{C.CYAN}{C.BOLD}  {title}{C.RESET}")
+    print(f"{C.CYAN}{'═' * width}{C.RESET}")
+
+def hit(label: str, value: str):
+    """Print a notable finding."""
+    print(f"  {C.YELLOW}[+]{C.RESET} {C.BOLD}{label}:{C.RESET} {value}")
+
+def info(label: str, value: str):
+    """Print an informational item."""
+    print(f"  {C.GREEN}[*]{C.RESET} {label}: {value}")
+
+def warn(msg: str):
+    print(f"  {C.RED}[!]{C.RESET} {C.RED}{msg}{C.RESET}")
+
+def dim(msg: str):
+    print(f"  {C.GREY}{msg}{C.RESET}")
+
+def run(cmd: str, shell=True, timeout=10) -> str:
+    """Run a shell command and return stdout; empty string on error."""
+    try:
+        result = subprocess.run(
+            cmd, shell=shell, capture_output=True, text=True, timeout=timeout
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────
+#  OS Detection
+# ─────────────────────────────────────────────
+IS_LINUX   = sys.platform.startswith("linux")
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC     = sys.platform == "darwin"
+
+
+# ═════════════════════════════════════════════
+#  MODULE 1 — System Info
+# ═════════════════════════════════════════════
+def enum_system():
+    section("SYSTEM INFORMATION")
+
+    info("Hostname",        socket.gethostname())
+    info("OS",             platform.platform())
+    info("Architecture",   platform.machine())
+    info("Python",         sys.version.split()[0])
+
+    if IS_LINUX:
+        # Kernel version
+        kernel = run("uname -r")
+        info("Kernel", kernel)
+
+        # Try to detect distro
+        distro = run("cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2")
+        if distro:
+            info("Distro", distro.strip('"'))
+
+        # CPU info
+        cpuinfo = run("grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2")
+        if cpuinfo:
+            info("CPU", cpuinfo.strip())
+
+        # Uptime
+        uptime = run("uptime -p")
+        if uptime:
+            info("Uptime", uptime)
+
+        # Check if we're in a container / VM
+        if os.path.exists("/.dockerenv"):
+            warn("Running inside a DOCKER container")
+        virt = run("systemd-detect-virt 2>/dev/null")
+        if virt and virt != "none":
+            hit("Virtualization", virt)
+
+        # Interesting mounts
+        mounts = run("mount | grep -v 'proc\\|sys\\|dev\\|run\\|cgroup'")
+        if mounts:
+            print(f"\n  {C.BOLD}Non-standard Mounts:{C.RESET}")
+            for line in mounts.splitlines():
+                dim(f"    {line}")
+
+    elif IS_WINDOWS:
+        info("Windows version", run("ver"))
+        info("SystemInfo (brief)", run("systeminfo | findstr /C:\"OS Name\" /C:\"OS Version\" /C:\"System Type\""))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 2 — User Enumeration
+# ═════════════════════════════════════════════
+def enum_users():
+    section("USER ENUMERATION")
+
+    # Current user
+    current = run("whoami")
+    uid = os.getuid() if IS_LINUX else "N/A"
+    hit("Current user", f"{current}  (uid={uid})")
+
+    if uid == 0:
+        warn("Running as ROOT — full access")
+
+    if IS_LINUX:
+        # All users from /etc/passwd with login shells
+        print(f"\n  {C.BOLD}Users with login shells:{C.RESET}")
+        try:
+            for pw in pwd.getpwall():
+                shell = pw.pw_shell
+                if shell and shell not in ("/bin/false", "/usr/sbin/nologin", "/sbin/nologin"):
+                    tag = ""
+                    if pw.pw_uid == 0:
+                        tag = f" {C.RED}[ROOT]{C.RESET}"
+                    elif pw.pw_uid < 1000:
+                        tag = f" {C.GREY}[system]{C.RESET}"
+                    else:
+                        tag = f" {C.GREEN}[user]{C.RESET}"
+                    print(f"    {pw.pw_name:<20} uid={pw.pw_uid:<6} shell={shell}{tag}")
+        except Exception as e:
+            warn(f"Could not read /etc/passwd: {e}")
+
+        # Home directories
+        print(f"\n  {C.BOLD}Home directories (readable):{C.RESET}")
+        for home in Path("/home").iterdir() if Path("/home").exists() else []:
+            try:
+                readable = os.access(home, os.R_OK)
+                flag = f"{C.GREEN}[readable]{C.RESET}" if readable else f"{C.GREY}[no access]{C.RESET}"
+                print(f"    {home}  {flag}")
+                if readable:
+                    # Peek for interesting files
+                    for fname in [".bash_history", ".ssh", ".aws", ".gnupg", ".profile", ".bashrc"]:
+                        fpath = home / fname
+                        if fpath.exists():
+                            hit("  Interesting", str(fpath))
+            except Exception:
+                pass
+
+        # Last logins
+        last = run("last -n 10 2>/dev/null | head -15")
+        if last:
+            print(f"\n  {C.BOLD}Recent logins:{C.RESET}")
+            for line in last.splitlines():
+                dim(f"    {line}")
+
+        # Currently logged in
+        who = run("who 2>/dev/null || w 2>/dev/null | head -5")
+        if who:
+            print(f"\n  {C.BOLD}Currently logged in:{C.RESET}")
+            for line in who.splitlines():
+                dim(f"    {line}")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Local Users:{C.RESET}")
+        users = run("net user")
+        dim(users)
+        print(f"\n  {C.BOLD}Administrators:{C.RESET}")
+        admins = run("net localgroup administrators")
+        dim(admins)
+
+
+# ═════════════════════════════════════════════
+#  MODULE 3 — Group Enumeration
+# ═════════════════════════════════════════════
+def enum_groups():
+    section("GROUP ENUMERATION")
+
+    # Interesting groups that grant elevated access
+    INTERESTING_GROUPS = {
+        "sudo", "wheel", "adm", "admin", "root",
+        "docker", "lxd", "lxc", "disk", "shadow",
+        "video", "staff", "dba", "www-data", "ftp",
+        "operator", "systemd-journal", "kmem", "tape",
+        "plugdev", "bluetooth", "netdev",
+    }
+
+    if IS_LINUX:
+        print(f"\n  {C.BOLD}Current user groups:{C.RESET}")
+        try:
+            current_groups = [grp.getgrgid(gid).gr_name for gid in os.getgroups()]
+            for g in current_groups:
+                tag = ""
+                if g in INTERESTING_GROUPS:
+                    tag = f"  {C.RED}<<< INTERESTING!{C.RESET}"
+                print(f"    {g}{tag}")
+        except Exception as e:
+            dim(run("id"))
+
+        # Map all groups → members, highlight interesting ones
+        print(f"\n  {C.BOLD}All groups & members (non-empty):{C.RESET}")
+        try:
+            for gr in grp.getgrall():
+                if gr.gr_mem:
+                    tag = f"  {C.RED}[!]{C.RESET}" if gr.gr_name in INTERESTING_GROUPS else ""
+                    print(f"    {gr.gr_name:<20} {', '.join(gr.gr_mem)}{tag}")
+        except Exception as e:
+            warn(f"Could not enumerate groups: {e}")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Local Groups:{C.RESET}")
+        dim(run("net localgroup"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 4 — Sudo / Privileges
+# ═════════════════════════════════════════════
+def enum_sudo():
+    section("SUDO / PRIVILEGE ESCALATION PATHS")
+
+    if IS_LINUX:
+        # sudo -l
+        print(f"\n  {C.BOLD}sudo -l output:{C.RESET}")
+        sudo_out = run("sudo -l 2>/dev/null")
+        if sudo_out:
+            for line in sudo_out.splitlines():
+                if any(x in line for x in ["ALL", "NOPASSWD", "(root)"]):
+                    hit("SUDO RULE", line.strip())
+                else:
+                    dim(f"    {line}")
+        else:
+            dim("    (no sudo access or password required)")
+
+        # SUID binaries
+        print(f"\n  {C.BOLD}SUID binaries:{C.RESET}")
+        suid_bins = run("find / -perm -4000 -type f 2>/dev/null")
+        # Common baseline — these are expected
+        COMMON_SUID = {
+            "/usr/bin/sudo", "/usr/bin/passwd", "/usr/bin/chsh",
+            "/usr/bin/chfn", "/usr/bin/newgrp", "/usr/bin/gpasswd",
+            "/bin/su", "/bin/mount", "/bin/umount", "/usr/bin/su",
+            "/usr/lib/openssh/ssh-keysign", "/usr/bin/pkexec",
+        }
+        for line in suid_bins.splitlines():
+            line = line.strip()
+            if line not in COMMON_SUID:
+                hit("Non-standard SUID", line)
+            else:
+                dim(f"    {line}  (standard)")
+
+        # SGID binaries
+        print(f"\n  {C.BOLD}SGID binaries (non-standard):{C.RESET}")
+        sgid_bins = run("find / -perm -2000 -type f 2>/dev/null")
+        COMMON_SGID = {"/usr/bin/wall", "/usr/bin/write", "/usr/bin/ssh-agent",
+                       "/sbin/unix_chkpwd", "/usr/bin/crontab", "/usr/bin/dotlockfile"}
+        for line in sgid_bins.splitlines():
+            if line.strip() not in COMMON_SGID:
+                hit("Non-standard SGID", line.strip())
+
+        # Capabilities
+        print(f"\n  {C.BOLD}File capabilities:{C.RESET}")
+        caps = run("getcap -r / 2>/dev/null")
+        if caps:
+            for line in caps.splitlines():
+                hit("Capability", line.strip())
+        else:
+            dim("    (none found or getcap not available)")
+
+        # Writable /etc/passwd or /etc/shadow
+        for sensitive in ["/etc/passwd", "/etc/shadow", "/etc/sudoers"]:
+            if os.path.exists(sensitive) and os.access(sensitive, os.W_OK):
+                warn(f"WRITABLE SENSITIVE FILE: {sensitive}")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Privileges for current user:{C.RESET}")
+        dim(run("whoami /priv"))
+        print(f"\n  {C.BOLD}Token groups:{C.RESET}")
+        dim(run("whoami /groups"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 5 — Non-standard Binaries
+# ═════════════════════════════════════════════
+def enum_interesting_binaries():
+    section("INTERESTING / NON-STANDARD BINARIES")
+
+    # GTFOBins-style list — these are interesting if found
+    INTERESTING = [
+        # Networking/exfil
+        "nc", "ncat", "netcat", "curl", "wget", "fetch", "tftp", "ftp",
+        "scp", "rsync", "socat", "nmap", "masscan",
+        # Scripting / shells
+        "python", "python2", "python3", "python3.x", "perl", "ruby",
+        "lua", "php", "node", "nodejs", "tclsh", "expect",
+        "bash", "dash", "zsh", "ksh", "fish",
+        # Compilers
+        "gcc", "cc", "g++", "make", "cmake", "go", "rustc",
+        # Editors (can spawn shells)
+        "vim", "vi", "nano", "emacs", "ed", "awk", "gawk", "mawk",
+        # File access / archive
+        "tar", "zip", "unzip", "7z", "gzip", "bzip2",
+        "dd", "cp", "mv", "cat", "tee", "less", "more",
+        # DB clients
+        "mysql", "psql", "sqlite3", "mongo",
+        # Misc powerful
+        "docker", "kubectl", "lxc", "lxd",
+        "strace", "ltrace", "gdb", "pwndbg",
+        "openssl", "base64", "xxd",
+    ]
+
+    print(f"\n  {C.BOLD}Checking for interesting binaries in PATH:{C.RESET}")
+    found = []
+    for binary in INTERESTING:
+        path = which(binary)
+        if path:
+            found.append((binary, path))
+
+    if found:
+        for name, path in found:
+            print(f"    {C.GREEN}[+]{C.RESET} {name:<20} → {path}")
+    else:
+        dim("    None found in PATH")
+
+    if IS_LINUX:
+        # Writable directories in PATH — can be used for PATH hijacking
+        print(f"\n  {C.BOLD}PATH hijacking check (writable dirs in $PATH):{C.RESET}")
+        path_dirs = os.environ.get("PATH", "").split(":")
+        for d in path_dirs:
+            if d and os.path.isdir(d) and os.access(d, os.W_OK):
+                warn(f"WRITABLE PATH dir: {d}")
+
+        # Custom binaries in /opt, /usr/local, etc.
+        print(f"\n  {C.BOLD}Binaries in non-standard locations:{C.RESET}")
+        for search_dir in ["/opt", "/usr/local/bin", "/usr/local/sbin", "/home"]:
+            if os.path.isdir(search_dir):
+                result = run(f"find {search_dir} -type f -executable 2>/dev/null | head -30")
+                if result:
+                    for line in result.splitlines():
+                        dim(f"    {line}")
+
+
+# ═════════════════════════════════════════════
+#  MODULE 6 — Scheduled Jobs / Cron
+# ═════════════════════════════════════════════
+def enum_jobs():
+    section("SCHEDULED JOBS & CRON")
+
+    if IS_LINUX:
+        # System crontabs
+        cron_locations = [
+            "/etc/crontab",
+            "/etc/cron.d",
+            "/etc/cron.hourly",
+            "/etc/cron.daily",
+            "/etc/cron.weekly",
+            "/etc/cron.monthly",
+            "/var/spool/cron/crontabs",
+        ]
+
+        print(f"\n  {C.BOLD}System cron locations:{C.RESET}")
+        for loc in cron_locations:
+            p = Path(loc)
+            if p.exists():
+                if p.is_file():
+                    content = run(f"cat {loc} 2>/dev/null")
+                    if content and not content.startswith("#"):
+                        hit("Cron file", loc)
+                        for line in content.splitlines():
+                            if line and not line.startswith("#"):
+                                dim(f"      {line}")
+                elif p.is_dir():
+                    files = list(p.iterdir())
+                    if files:
+                        hit("Cron dir", f"{loc}  ({len(files)} entries)")
+                        for f in files:
+                            content = run(f"cat {f} 2>/dev/null")
+                            for line in content.splitlines():
+                                if line and not line.startswith("#"):
+                                    dim(f"      [{f.name}] {line}")
+
+        # User crontabs
+        print(f"\n  {C.BOLD}User crontabs (/var/spool/cron):{C.RESET}")
+        spool = Path("/var/spool/cron/crontabs")
+        if spool.exists():
+            for entry in spool.iterdir():
+                content = run(f"cat {entry} 2>/dev/null")
+                if content:
+                    hit("User crontab", str(entry))
+                    for line in content.splitlines():
+                        if line and not line.startswith("#"):
+                            dim(f"      {line}")
+        else:
+            dim("    /var/spool/cron/crontabs not accessible")
+
+        # Current user's crontab
+        user_cron = run("crontab -l 2>/dev/null")
+        if user_cron and "no crontab" not in user_cron.lower():
+            hit("Current user crontab", "")
+            for line in user_cron.splitlines():
+                if line and not line.startswith("#"):
+                    dim(f"      {line}")
+
+        # systemd timers
+        print(f"\n  {C.BOLD}Systemd timers:{C.RESET}")
+        timers = run("systemctl list-timers --all 2>/dev/null | head -30")
+        if timers:
+            for line in timers.splitlines():
+                dim(f"    {line}")
+        else:
+            dim("    (systemctl not available or no timers)")
+
+        # at jobs
+        atq = run("atq 2>/dev/null")
+        if atq:
+            hit("at jobs queued", atq)
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Scheduled Tasks:{C.RESET}")
+        tasks = run("schtasks /query /fo LIST /v 2>nul | findstr /C:\"Task Name\" /C:\"Status\" /C:\"Run As User\"")
+        dim(tasks)
+
+
+# ═════════════════════════════════════════════
+#  MODULE 7 — Writable Files & Directories
+# ═════════════════════════════════════════════
+def enum_writable():
+    section("WRITABLE FILES & DIRECTORIES")
+
+    if IS_LINUX:
+        SKIP_DIRS = {
+            "/proc", "/sys", "/dev", "/run", "/tmp",
+            "/var/tmp", "/var/lock", "/var/run",
+        }
+
+        # World-writable directories (excluding /tmp etc.)
+        print(f"\n  {C.BOLD}World-writable directories (non-standard):{C.RESET}")
+        ww_dirs = run("find / -maxdepth 5 -type d -perm -0002 2>/dev/null")
+        for d in ww_dirs.splitlines():
+            d = d.strip()
+            if not any(d.startswith(skip) for skip in SKIP_DIRS) and d not in SKIP_DIRS:
+                hit("World-writable dir", d)
+
+        # Writable files in interesting locations
+        print(f"\n  {C.BOLD}Writable files in sensitive locations:{C.RESET}")
+        SENSITIVE_DIRS = ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+                          "/usr/local/bin", "/opt", "/var/www"]
+        for d in SENSITIVE_DIRS:
+            if os.path.isdir(d):
+                result = run(f"find {d} -maxdepth 3 -writable -type f 2>/dev/null")
+                for f in result.splitlines():
+                    warn(f"WRITABLE: {f}")
+
+        # Writable scripts referenced in cron / systemd
+        print(f"\n  {C.BOLD}Writable scripts called by cron/systemd:{C.RESET}")
+        cron_scripts = run(
+            "grep -rh '^[^#]' /etc/crontab /etc/cron.d/* /var/spool/cron/crontabs/* 2>/dev/null"
+            " | awk '{print $NF}' | grep '^/' | sort -u"
+        )
+        for script in cron_scripts.splitlines():
+            script = script.strip()
+            if script and os.path.isfile(script) and os.access(script, os.W_OK):
+                warn(f"WRITABLE CRON SCRIPT: {script}")
+
+        # /tmp contents
+        print(f"\n  {C.BOLD}/tmp contents:{C.RESET}")
+        tmp_contents = run("ls -la /tmp 2>/dev/null")
+        if tmp_contents:
+            for line in tmp_contents.splitlines():
+                dim(f"    {line}")
+
+        # NFS exports with no_root_squash
+        print(f"\n  {C.BOLD}NFS exports (no_root_squash check):{C.RESET}")
+        exports = run("cat /etc/exports 2>/dev/null")
+        if exports:
+            for line in exports.splitlines():
+                if line and not line.startswith("#"):
+                    if "no_root_squash" in line:
+                        warn(f"NFS no_root_squash: {line}")
+                    else:
+                        dim(f"    {line}")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Writable dirs in Program Files:{C.RESET}")
+        dim(run("icacls \"C:\\Program Files\" /T 2>nul | findstr /C:\"Everyone\" /C:\"BUILTIN\\Users\""))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 8 — Running Services & Localhost Ports
+# ═════════════════════════════════════════════
+def enum_services():
+    section("LOCAL SERVICES & INTERNAL PORTS")
+
+    if IS_LINUX:
+        # Listening ports — localhost only (these are hidden from outside scans)
+        print(f"\n  {C.BOLD}Ports ONLY listening on localhost (internal services):{C.RESET}")
+        ss_out = run("ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")
+        for line in ss_out.splitlines():
+            if any(x in line for x in ["127.0.0.1", "::1", "localhost"]):
+                hit("Internal port", line.strip())
+
+        # All listening sockets
+        print(f"\n  {C.BOLD}All listening TCP sockets:{C.RESET}")
+        for line in ss_out.splitlines()[1:]:  # skip header
+            dim(f"    {line}")
+
+        # UDP sockets
+        print(f"\n  {C.BOLD}Listening UDP sockets:{C.RESET}")
+        udp = run("ss -ulnp 2>/dev/null || netstat -ulnp 2>/dev/null")
+        for line in udp.splitlines()[1:]:
+            dim(f"    {line}")
+
+        # Running processes (non-root ones are interesting too)
+        print(f"\n  {C.BOLD}Running processes (interesting):{C.RESET}")
+        ps = run("ps auxww 2>/dev/null")
+        IGNORE_PROCS = {"ps", "grep", "bash", "sh", "python", "python3", "sshd:", "["}
+        for line in ps.splitlines():
+            parts = line.split()
+            if len(parts) > 10:
+                user = parts[0]
+                cmd  = " ".join(parts[10:])
+                if any(cmd.startswith(ign) for ign in IGNORE_PROCS):
+                    continue
+                if user == "root":
+                    print(f"    {C.RED}[root]{C.RESET} {cmd[:100]}")
+                else:
+                    dim(f"    [{user}] {cmd[:100]}")
+
+        # systemd services
+        print(f"\n  {C.BOLD}Active systemd services:{C.RESET}")
+        sysd = run("systemctl list-units --type=service --state=running 2>/dev/null | head -30")
+        if sysd:
+            for line in sysd.splitlines():
+                dim(f"    {line}")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Listening ports:{C.RESET}")
+        dim(run("netstat -ano | findstr LISTENING"))
+        print(f"\n  {C.BOLD}Running services:{C.RESET}")
+        dim(run("sc query state= all | findstr SERVICE_NAME"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 9 — Credentials & Sensitive Files
+# ═════════════════════════════════════════════
+def enum_credentials():
+    section("CREDENTIALS & SENSITIVE FILES")
+
+    if IS_LINUX:
+        # Common credential file locations
+        CRED_FILES = [
+            # Config / app credentials
+            "/var/www/html/config.php", "/var/www/html/wp-config.php",
+            "/var/www/html/.env", "/var/www/.env",
+            "/home/*/.env", "/root/.env",
+            # DB
+            "/etc/mysql/debian.cnf", "/root/.mysql_history",
+            "/home/*/.mysql_history",
+            # SSH
+            "/home/*/.ssh/id_rsa", "/root/.ssh/id_rsa",
+            "/home/*/.ssh/authorized_keys", "/root/.ssh/authorized_keys",
+            # History files
+            "/home/*/.bash_history", "/root/.bash_history",
+            "/home/*/.zsh_history",
+            # Cloud
+            "/home/*/.aws/credentials", "/root/.aws/credentials",
+            # Misc
+            "/etc/passwd", "/etc/shadow", "/etc/group",
+            "/etc/security/opasswd",
+        ]
+
+        print(f"\n  {C.BOLD}Checking sensitive file locations:{C.RESET}")
+        for pattern in CRED_FILES:
+            # Handle glob patterns manually
+            if "*" in pattern:
+                import glob
+                matches = glob.glob(pattern)
+            else:
+                matches = [pattern] if os.path.exists(pattern) else []
+
+            for fpath in matches:
+                p = Path(fpath)
+                if p.exists():
+                    readable = os.access(fpath, os.R_OK)
+                    size = p.stat().st_size
+                    flag = f"{C.GREEN}[readable]{C.RESET}" if readable else f"{C.GREY}[no access]{C.RESET}"
+                    hit(flag, f"{fpath}  ({size} bytes)")
+
+                    # Peek into history files for passwords
+                    if readable and "history" in fpath and size < 50000:
+                        content = run(f"grep -i 'pass\\|secret\\|token\\|api\\|key\\|user\\|mysql\\|psql' {fpath} 2>/dev/null | head -10")
+                        if content:
+                            warn(f"  Interesting lines in {fpath}:")
+                            for line in content.splitlines():
+                                dim(f"      {line}")
+
+        # /etc/shadow readable?
+        if os.access("/etc/shadow", os.R_OK):
+            warn("/etc/shadow IS READABLE — try cracking hashes!")
+            shadow = run("cat /etc/shadow 2>/dev/null | grep -v ':\\*:\\|:!:'")
+            if shadow:
+                for line in shadow.splitlines():
+                    print(f"    {C.RED}{line}{C.RESET}")
+
+        # Config files with passwords in web roots
+        print(f"\n  {C.BOLD}Searching for password strings in web/config files:{C.RESET}")
+        grep_out = run(
+            "grep -rn --include='*.php' --include='*.conf' --include='*.ini' "
+            "--include='*.env' --include='*.cfg' --include='*.xml' "
+            "-i 'password\\s*=\\|passwd\\s*=\\|db_pass\\|secret_key' "
+            "/var/www /etc /opt 2>/dev/null | head -20"
+        )
+        if grep_out:
+            for line in grep_out.splitlines():
+                hit("Possible credential", line[:120])
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}SAM / credential files:{C.RESET}")
+        for f in [r"C:\Windows\System32\config\SAM",
+                  r"C:\Windows\repair\SAM",
+                  r"C:\Windows\System32\config\SYSTEM"]:
+            if os.path.exists(f):
+                hit("Found", f)
+        print(f"\n  {C.BOLD}Stored credentials:{C.RESET}")
+        dim(run("cmdkey /list"))
+        dim(run("reg query HKLM /f password /t REG_SZ /s 2>nul | head -40"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 10 — Network Information
+# ═════════════════════════════════════════════
+def enum_network():
+    section("NETWORK INFORMATION")
+
+    if IS_LINUX:
+        # Interfaces
+        print(f"\n  {C.BOLD}Network interfaces:{C.RESET}")
+        ifaces = run("ip addr 2>/dev/null || ifconfig 2>/dev/null")
+        for line in ifaces.splitlines():
+            dim(f"    {line}")
+
+        # Routes — pivoting paths
+        print(f"\n  {C.BOLD}Routing table (pivot targets):{C.RESET}")
+        routes = run("ip route 2>/dev/null || route -n 2>/dev/null")
+        for line in routes.splitlines():
+            dim(f"    {line}")
+
+        # ARP cache — other hosts
+        print(f"\n  {C.BOLD}ARP cache (other hosts in network):{C.RESET}")
+        arp = run("arp -n 2>/dev/null || ip neigh 2>/dev/null")
+        for line in arp.splitlines():
+            dim(f"    {line}")
+
+        # /etc/hosts
+        print(f"\n  {C.BOLD}/etc/hosts (custom entries):{C.RESET}")
+        hosts = run("grep -v '^#\\|^$\\|localhost\\|127.0.0.1\\|::1' /etc/hosts 2>/dev/null")
+        if hosts:
+            for line in hosts.splitlines():
+                hit("Custom hosts entry", line)
+
+        # SSH known_hosts
+        print(f"\n  {C.BOLD}SSH known_hosts (possible pivot targets):{C.RESET}")
+        for kh in ["/home/*/.ssh/known_hosts", "/root/.ssh/known_hosts"]:
+            import glob
+            for f in glob.glob(kh):
+                if os.access(f, os.R_OK):
+                    content = run(f"cat {f} 2>/dev/null")
+                    if content:
+                        hit("known_hosts", f)
+                        for line in content.splitlines()[:10]:
+                            dim(f"      {line[:80]}")
+
+    elif IS_WINDOWS:
+        dim(run("ipconfig /all"))
+        dim(run("route print"))
+        dim(run("arp -a"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 11 — Installed Packages / Apps
+# ═════════════════════════════════════════════
+def enum_software():
+    section("INSTALLED SOFTWARE & VERSIONS")
+
+    if IS_LINUX:
+        # Package manager
+        print(f"\n  {C.BOLD}Installed packages (condensed):{C.RESET}")
+        if which("dpkg"):
+            pkgs = run("dpkg -l 2>/dev/null | grep '^ii' | awk '{print $2, $3}' | head -60")
+        elif which("rpm"):
+            pkgs = run("rpm -qa --queryformat '%{NAME} %{VERSION}\\n' 2>/dev/null | head -60")
+        else:
+            pkgs = ""
+        for line in pkgs.splitlines():
+            dim(f"    {line}")
+
+        # Interesting version checks
+        print(f"\n  {C.BOLD}Key software versions:{C.RESET}")
+        for prog in ["sudo", "bash", "openssl", "curl", "wget", "mysql", "apache2",
+                     "nginx", "php", "python3", "ruby", "perl", "gcc"]:
+            p = which(prog)
+            if p:
+                ver = run(f"{prog} --version 2>&1 | head -1")
+                info(prog, ver[:80] if ver else "found")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Installed programs:{C.RESET}")
+        dim(run("wmic product get name,version 2>nul | head -40"))
+
+
+# ═════════════════════════════════════════════
+#  MODULE 12 — Environment & PATH
+# ═════════════════════════════════════════════
+def enum_environment():
+    section("ENVIRONMENT & SHELL")
+
+    print(f"\n  {C.BOLD}Environment variables (filtered):{C.RESET}")
+    for key, val in sorted(os.environ.items()):
+        if any(kw in key.upper() for kw in [
+            "PASS", "SECRET", "TOKEN", "API", "KEY",
+            "AWS", "AZURE", "GCP", "DB", "DATABASE"
+        ]):
+            warn(f"Sensitive env var: {key}={val}")
+        elif key in ["PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "HOSTNAME"]:
+            info(key, val)
+
+    # LD_PRELOAD / LD_LIBRARY_PATH — potential for hijacking
+    for dangerous_var in ["LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH"]:
+        val = os.environ.get(dangerous_var)
+        if val:
+            warn(f"{dangerous_var} is set: {val}")
+
+    if IS_LINUX:
+        # Check for interesting aliases
+        rc_files = [Path.home() / ".bashrc", Path.home() / ".bash_aliases",
+                    Path.home() / ".profile", Path.home() / ".zshrc"]
+        print(f"\n  {C.BOLD}Shell aliases & overrides:{C.RESET}")
+        for rc in rc_files:
+            if rc.exists() and os.access(rc, os.R_OK):
+                aliases = run(f"grep -i 'alias\\|export.*pass\\|export.*token\\|export.*key' {rc} 2>/dev/null")
+                if aliases:
+                    hit("Found in", str(rc))
+                    for line in aliases.splitlines():
+                        dim(f"      {line}")
+
+
+# ═════════════════════════════════════════════
+#  MODULE 13 — Container Discovery & Pivoting
+# ═════════════════════════════════════════════
+def enum_container():
+    section("CONTAINER DISCOVERY & PIVOT TARGETS")
+
+    if IS_LINUX:
+
+        # ── Where are we? (context only, not the goal) ──────────────
+        print(f"\n  {C.BOLD}Current environment:{C.RESET}")
+        in_docker = os.path.exists("/.dockerenv")
+        cgroup    = run("cat /proc/1/cgroup 2>/dev/null")
+        in_lxc    = "lxc" in cgroup
+
+        if in_docker:
+            info("Environment", "Inside a Docker container")
+        elif in_lxc:
+            info("Environment", "Inside an LXC container")
+        else:
+            info("Environment", "Appears to be a bare host or VM")
+
+        cap_bnd = run("grep CapBnd /proc/self/status 2>/dev/null | awk '{print $2}'")
+        if cap_bnd:
+            if "ffffffffffffffff" in cap_bnd:
+                warn("Full capabilities (CapBnd=fff...) — privileged container!")
+            else:
+                info("CapBnd", cap_bnd)
+
+        # ── Docker socket — control plane access ────────────────────
+        print(f"\n  {C.BOLD}Docker socket:{C.RESET}")
+        for sock in ["/var/run/docker.sock", "/run/docker.sock"]:
+            if os.path.exists(sock):
+                if os.access(sock, os.R_OK | os.W_OK):
+                    warn(f"Docker socket READABLE/WRITABLE: {sock}")
+                    warn("Can enumerate and escape to host via 'docker run -v /:/mnt'")
+
+                    # List all running containers on this host
+                    print(f"\n  {C.BOLD}Containers running on this host (via docker ps):{C.RESET}")
+                    docker_ps = run("docker ps --format 'table {{.ID}}\\t{{.Image}}\\t{{.Names}}\\t{{.Ports}}\\t{{.Status}}' 2>/dev/null")
+                    if docker_ps:
+                        for line in docker_ps.splitlines():
+                            hit("Container", line)
+                    else:
+                        dim("    (docker binary not in PATH — try curl --unix-socket)")
+
+                    # Docker API via curl if docker binary missing
+                    print(f"\n  {C.BOLD}Containers via Docker API (curl fallback):{C.RESET}")
+                    api_out = run(f"curl -s --unix-socket {sock} http://localhost/containers/json 2>/dev/null | python3 -m json.tool 2>/dev/null | grep -E 'Id|Image|Name|Status|Ports' | head -40")
+                    if api_out:
+                        for line in api_out.splitlines():
+                            dim(f"    {line}")
+
+                    # List all images — may reveal what apps are deployed
+                    print(f"\n  {C.BOLD}Docker images on host:{C.RESET}")
+                    images = run("docker images --format '{{.Repository}}:{{.Tag}}\\t{{.Size}}' 2>/dev/null")
+                    if images:
+                        for line in images.splitlines():
+                            info("Image", line)
+
+                    # Docker networks — reveals internal subnets
+                    print(f"\n  {C.BOLD}Docker networks (internal subnets):{C.RESET}")
+                    nets = run("docker network ls 2>/dev/null")
+                    if nets:
+                        for line in nets.splitlines():
+                            dim(f"    {line}")
+                    net_detail = run("docker network inspect bridge 2>/dev/null | grep -E 'Subnet|Gateway|IPv4Address' | head -20")
+                    if net_detail:
+                        for line in net_detail.splitlines():
+                            hit("Network detail", line.strip())
+
+        # ── LXD / LXC group — instant root escape ───────────────────
+        print(f"\n  {C.BOLD}LXD/LXC group membership:{C.RESET}")
+        try:
+            current_groups = [grp.getgrgid(gid).gr_name for gid in os.getgroups()]
+            if "lxd" in current_groups:
+                warn("In lxd group — escape: lxc init ubuntu:18.04 privesc -c security.privileged=true")
+            elif "lxc" in current_groups:
+                warn("In lxc group — container escape may be possible")
+            else:
+                dim("    Not in lxd/lxc group")
+        except Exception:
+            pass
+
+        # ── Other containers visible via /proc ──────────────────────
+        print(f"\n  {C.BOLD}Other container processes visible in /proc:{C.RESET}")
+        # If we can see other namespaces, sibling containers may be visible
+        ns_out = run("ls -la /proc/*/ns/net 2>/dev/null | awk '{print $NF}' | sort -u | head -20")
+        namespaces = set()
+        for line in ns_out.splitlines():
+            if "net:[" in line:
+                namespaces.add(line.strip())
+        if len(namespaces) > 1:
+            hit("Multiple network namespaces", f"{len(namespaces)} found — sibling containers may exist")
+            for ns in sorted(namespaces):
+                dim(f"    {ns}")
+        else:
+            dim("    Only one network namespace visible")
+
+        # ── Internal subnet discovery ────────────────────────────────
+        print(f"\n  {C.BOLD}Internal subnets / container networks:{C.RESET}")
+        routes = run("ip route 2>/dev/null")
+        for line in routes.splitlines():
+            # Flag non-standard RFC1918 ranges that look like container networks
+            if any(x in line for x in ["172.16.", "172.17.", "172.18.", "172.19.",
+                                        "172.2", "10.0.", "10.1.", "192.168."]):
+                hit("Internal route", line.strip())
+            else:
+                dim(f"    {line}")
+
+        # ── /etc/hosts — internal hostnames ─────────────────────────
+        print(f"\n  {C.BOLD}/etc/hosts — internal container hostnames:{C.RESET}")
+        hosts = run("grep -v '^#\\|^$\\|127.0.0.1\\|::1' /etc/hosts 2>/dev/null")
+        if hosts:
+            for line in hosts.splitlines():
+                hit("Host entry", line.strip())
+        else:
+            dim("    No custom entries found")
+
+    elif IS_WINDOWS:
+        print(f"\n  {C.BOLD}Running containers (Windows):{C.RESET}")
+        dim(run("docker ps 2>nul"))
+
+
+
+
+# ═════════════════════════════════════════════
+#  MODULE 14 — Config & Code Analysis
+# ═════════════════════════════════════════════
+def enum_configs():
+    section("CONFIG & CODE ANALYSIS")
+
+    # ── Locations to scan ───────────────────────────────────────────
+    SCAN_ROOTS = [
+        "/var/www", "/opt", "/srv", "/app", "/api",
+        "/backend", "/home", "/etc", "/usr/local",
+    ]
+
+    # ── File extensions to collect ──────────────────────────────────
+    CONFIG_EXTS = {
+        ".ini", ".conf", ".cfg", ".env", ".xml",
+        ".yaml", ".yml", ".toml", ".properties",
+    }
+    CODE_EXTS = {
+        ".php", ".py", ".rb", ".js", ".sh",
+        ".pl", ".go", ".java", ".ts",
+    }
+    ALL_EXTS = CONFIG_EXTS | CODE_EXTS
+
+    # ── High-value filenames regardless of extension ─────────────────
+    INTERESTING_NAMES = {
+        "database.yml", "database.php", "db.php", "db.py",
+        "settings.py", "settings.php", "config.php", "config.py",
+        "config.rb", "config.js", "configuration.php",
+        "application.yml", "application.properties",
+        "wp-config.php", ".env", "secrets.yml",
+        "docker-compose.yml", "supervisord.conf",
+    }
+
+    # ── Dangerous patterns per language ─────────────────────────────
+    # Each entry: (regex_pattern, description, severity)
+    # severity: 'crit' = red, 'warn' = yellow, 'info' = cyan
+    PATTERNS = [
+        # ── Shell execution ──────────────────────────────────────────
+        (r"exec\s*\(.*\$",                          "exec() with variable input",              "crit"),
+        (r"system\s*\(.*\$",                        "system() with variable input",            "crit"),
+        (r"shell_exec\s*\(.*\$",                    "shell_exec() with variable input",        "crit"),
+        (r"passthru\s*\(.*\$",                      "passthru() with variable input",          "crit"),
+        (r"popen\s*\(.*\$",                         "popen() with variable input",             "crit"),
+        (r"proc_open\s*\(.*\$",                     "proc_open() with variable input",         "crit"),
+        (r"os\.system\s*\(",                        "os.system() call",                        "crit"),
+        (r"os\.popen\s*\(",                         "os.popen() call",                         "crit"),
+        (r"subprocess\.(call|run|Popen)\s*\(.*shell\s*=\s*True", "subprocess with shell=True","crit"),
+        (r"`.*\$.*`",                               "Backtick shell execution with variable",   "crit"),
+        (r"eval\s*\(.*\$",                          "eval() with variable input",              "crit"),
+        (r"eval\s*\(.*request",                     "eval() with request input",               "crit"),
+        (r"assert\s*\(.*\$_(GET|POST|REQUEST)",     "assert() with user input (PHP RCE)",      "crit"),
+
+        # ── SQL injection ────────────────────────────────────────────
+        (r"[\"']SELECT.*\+.*[\"']",                 "SQL string concatenation",                "crit"),
+        (r"[\"']INSERT.*\+.*[\"']",                 "SQL INSERT concatenation",                "crit"),
+        (r"[\"']UPDATE.*\+.*[\"']",                 "SQL UPDATE concatenation",                "crit"),
+        (r"[\"']DELETE.*\+.*[\"']",                 "SQL DELETE concatenation",                "crit"),
+        (r"f[\"'].*SELECT.*\{",                     "SQL f-string injection (Python)",         "crit"),
+        (r"sprintf.*SELECT.*\$",                    "SQL sprintf injection",                   "crit"),
+        (r"mysql_query\s*\(\s*[\"'].*\$",           "Unsanitized mysql_query()",               "crit"),
+        (r"\$_(GET|POST|REQUEST|COOKIE)\[.*\].*SELECT", "User input direct to SQL",           "crit"),
+
+        # ── File inclusion / path traversal ─────────────────────────
+        (r"include\s*\(\s*\$_(GET|POST|REQUEST)",   "include() with user input (LFI/RFI)",    "crit"),
+        (r"require\s*\(\s*\$_(GET|POST|REQUEST)",   "require() with user input (LFI/RFI)",    "crit"),
+        (r"include_once\s*\(\s*\$_(GET|POST)",      "include_once() with user input",          "crit"),
+        (r"open\s*\(.*request\.",                   "File open with request input",            "crit"),
+        (r"open\s*\(.*\+.*\)",                      "File open with concatenated path",        "warn"),
+        (r"readfile\s*\(\s*\$_(GET|POST)",          "readfile() with user input",              "crit"),
+
+        # ── Deserialization ──────────────────────────────────────────
+        (r"unserialize\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)", "unserialize() user input",      "crit"),
+        (r"pickle\.loads\s*\(",                     "pickle.loads() — deserialization RCE",    "crit"),
+        (r"yaml\.load\s*\([^,)]*\)",                "yaml.load() without Loader= (unsafe)",   "warn"),
+        (r"Marshal\.load\s*\(",                     "Ruby Marshal.load() — deserialization",   "crit"),
+        (r"ObjectInputStream",                      "Java ObjectInputStream deserialization",  "warn"),
+
+        # ── Template injection ───────────────────────────────────────
+        (r"render_template_string\s*\(",            "Flask render_template_string() — SSTI",   "crit"),
+        (r"Environment\(.*loader.*\).*from_string", "Jinja2 from_string() — SSTI risk",       "warn"),
+        (r"ERB\.new\s*\(.*\$",                      "Ruby ERB with variable — SSTI",           "crit"),
+        (r"Twig.*createTemplate\s*\(",              "Twig createTemplate() — SSTI",            "crit"),
+
+        # ── XXE / XML ────────────────────────────────────────────────
+        (r"simplexml_load_string\s*\(",             "simplexml_load_string() — XXE risk",      "warn"),
+        (r"DOMDocument.*loadXML\s*\(",              "DOMDocument loadXML() — XXE risk",        "warn"),
+        (r"etree\.parse\s*\(",                      "lxml etree.parse() — XXE if not hardened","warn"),
+        (r"resolve_entities\s*=\s*True",            "XML entity resolution enabled",           "warn"),
+
+        # ── SSRF ─────────────────────────────────────────────────────
+        (r"(curl_exec|file_get_contents|requests\.get)\s*\(.*\$_(GET|POST|REQUEST)", "SSRF — user-controlled URL", "crit"),
+        (r"requests\.(get|post)\s*\(.*request\.",   "SSRF — user-controlled URL (Python)",    "crit"),
+        (r"urllib.*urlopen\s*\(.*request\.",        "SSRF — urllib with request input",        "crit"),
+
+        # ── Hardcoded secrets in code ─────────────────────────────────
+        (r"(password|passwd|secret|api_key|apikey|token)\s*=\s*['\"][^'\"]{6,}['\"]",
+                                                    "Hardcoded credential in code",            "warn"),
+        (r"(AWS_SECRET|AWS_KEY|PRIVATE_KEY)\s*=\s*['\"][^'\"]+['\"]",
+                                                    "Hardcoded cloud/crypto key",              "crit"),
+
+        # ── Weak crypto / random ─────────────────────────────────────
+        (r"md5\s*\(",                               "MD5 usage — weak hashing",                "info"),
+        (r"sha1\s*\(",                              "SHA1 usage — weak hashing",               "info"),
+        (r"random\.(random|randint|choice)\s*\(",  "Non-crypto random — predictable",          "info"),
+        (r"Math\.random\s*\(",                      "JS Math.random() — non-crypto",           "info"),
+    ]
+
+    # ── Limits to keep scan fast ─────────────────────────────────────
+    MAX_FILES     = 500    # stop collecting after this many files
+    MAX_FILE_SIZE = 512000 # skip files over 500KB
+    MAX_DEPTH     = 6      # max directory depth from each root
+
+    # ── Collect files ────────────────────────────────────────────────
+    print(f"\n  {C.BOLD}Scanning locations:{C.RESET}")
+    collected = []
+    for root in SCAN_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        if len(collected) >= MAX_FILES:
+            break
+        info("Scanning", root)
+        try:
+            root_depth = root.rstrip("/").count("/")
+            for dirpath, dirnames, filenames in os.walk(root):
+                # Enforce depth limit
+                current_depth = dirpath.rstrip("/").count("/") - root_depth
+                if current_depth >= MAX_DEPTH:
+                    dirnames.clear()
+                    continue
+                # Skip noise directories
+                dirnames[:] = [d for d in dirnames if d not in {
+                    ".git", "node_modules", "__pycache__", ".svn",
+                    "vendor", "cache", "tmp", "log", "logs",
+                    "test", "tests", "spec", "migrations",
+                }]
+                for fname in filenames:
+                    if len(collected) >= MAX_FILES:
+                        break
+                    fpath = os.path.join(dirpath, fname)
+                    ext   = os.path.splitext(fname)[1].lower()
+                    if ext in ALL_EXTS or fname.lower() in INTERESTING_NAMES:
+                        try:
+                            if os.access(fpath, os.R_OK) and os.path.getsize(fpath) <= MAX_FILE_SIZE:
+                                collected.append(fpath)
+                        except OSError:
+                            pass
+        except PermissionError:
+            pass
+
+    info("Files collected", str(len(collected)))
+
+    if not collected:
+        dim("    No readable config/code files found")
+        return
+
+    # ── Interesting filenames — show first ──────────────────────────
+    print(f"\n  {C.BOLD}High-value config files found:{C.RESET}")
+    named_hits = [f for f in collected if os.path.basename(f).lower() in INTERESTING_NAMES]
+    if named_hits:
+        for f in named_hits:
+            hit("Config", f)
+    else:
+        dim("    None of the known high-value filenames found")
+
+    # ── Pattern scan ────────────────────────────────────────────────
+    print(f"\n  {C.BOLD}Scanning for dangerous patterns:{C.RESET}")
+
+    SEV_COLOR = {
+        "crit": C.RED,
+        "warn": C.YELLOW,
+        "info": C.CYAN,
+    }
+    SEV_LABEL = {
+        "crit": "CRITICAL",
+        "warn": "WARNING ",
+        "info": "INFO    ",
+    }
+
+    total_findings = 0
+
+    for fpath in collected:
+        file_findings = []
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+
+            for lineno, line in enumerate(lines, start=1):
+                stripped = line.rstrip()
+                for pattern, desc, sev in PATTERNS:
+                    if re.search(pattern, stripped, re.IGNORECASE):
+                        # Grab context: 2 lines before and after
+                        ctx_start = max(0, lineno - 3)
+                        ctx_end   = min(len(lines), lineno + 2)
+                        context   = lines[ctx_start:ctx_end]
+                        file_findings.append((lineno, stripped, desc, sev, ctx_start + 1, context))
+                        break  # one match per line is enough
+
+        except Exception:
+            continue
+
+        if file_findings:
+            total_findings += len(file_findings)
+            print(f"\n  {C.BOLD}{C.WHITE}┌─ {fpath}{C.RESET}")
+
+            for lineno, line, desc, sev, ctx_lineno, context in file_findings:
+                col = SEV_COLOR[sev]
+                lbl = SEV_LABEL[sev]
+                print(f"  {col}│  [{lbl}] line {lineno} — {desc}{C.RESET}")
+
+                # Print context with the hit line highlighted
+                for i, ctx_line in enumerate(context):
+                    actual_lineno = ctx_lineno + i
+                    ctx_stripped  = ctx_line.rstrip()
+                    if actual_lineno == lineno:
+                        # Highlighted hit line
+                        print(f"  {col}│  {C.BOLD}  {actual_lineno:>4} ▶  {ctx_stripped}{C.RESET}")
+                    else:
+                        print(f"  {C.GREY}│       {actual_lineno:>4}    {ctx_stripped}{C.RESET}")
+                print(f"  {col}│{C.RESET}")
+
+            print(f"  {C.BOLD}{C.WHITE}└{'─' * 58}{C.RESET}")
+
+    if total_findings == 0:
+        dim("    No dangerous patterns found in scanned files")
+    else:
+        print(f"\n  {C.YELLOW}[+]{C.RESET} {C.BOLD}Total findings: {total_findings}{C.RESET}")
+
+    if IS_WINDOWS:
+        dim("    Config/code analysis not implemented for Windows")
+
+
+def print_summary(checks_run: list):
+    section("QUICK WINS SUMMARY")
+    print(f"\n  {C.BOLD}Checks completed:{C.RESET}")
+    for c in checks_run:
+        print(f"    {C.GREEN}✓{C.RESET}  {c}")
+    print(f"\n  {C.GREY}Run with --all to execute all checks{C.RESET}")
+    print(f"\n  {C.BOLD}Tips:{C.RESET}")
+    tips = [
+        "Run --configs on any box with web apps or custom services",
+        "Check sudo -l output against GTFOBins",
+        "Any writable cron script == PrivEsc",
+        "Docker socket readable == enumerate + escape to host via docker run",
+        "Check internal subnets via --container for sibling containers",
+        "lxd group membership == PrivEsc",
+        "If /etc/shadow readable, crack with hashcat/john",
+        "Internal ports may expose admin panels or DBs",
+        "Readable .bash_history may contain passwords",
+    ]
+    for tip in tips:
+        dim(f"  → {tip}")
+    print()
+
+
+def print_help():
+    banner()
+    print(f"""  {C.BOLD}USAGE{C.RESET}
+    nightowl [options]
+
+  {C.BOLD}SCAN MODULES{C.RESET}
+    {C.GREEN}--all{C.RESET}          Run every module (default if no flags given)
+    {C.GREEN}--system{C.RESET}       OS, kernel, distro, CPU, uptime, mounts, container detection
+    {C.GREEN}--users{C.RESET}        Users with login shells, home dirs, .ssh/.aws/.bash_history
+    {C.GREEN}--groups{C.RESET}       Group memberships — flags interesting groups (docker, lxd, sudo...)
+    {C.GREEN}--sudo{C.RESET}         sudo -l, SUID/SGID binaries, file capabilities, writable sensitive files
+    {C.GREEN}--binaries{C.RESET}     GTFOBins-style binary check, writable PATH dirs, /opt executables
+    {C.GREEN}--jobs{C.RESET}         Cron jobs (system + user), systemd timers, at queue
+    {C.GREEN}--writable{C.RESET}     World-writable dirs, writable files in /etc /bin /usr, NFS no_root_squash
+    {C.GREEN}--services{C.RESET}     Localhost-only ports (hidden from nmap), running processes, systemd units
+    {C.GREEN}--creds{C.RESET}        Config files, .env, wp-config, history files, /etc/shadow, AWS keys
+    {C.GREEN}--network{C.RESET}      Interfaces, routes, ARP cache, /etc/hosts, SSH known_hosts
+    {C.GREEN}--software{C.RESET}     Installed packages, key binary versions (sudo, openssl, php...)
+    {C.GREEN}--env{C.RESET}          Env vars (flags secrets), LD_PRELOAD hijack check, shell aliases
+    {C.GREEN}--container{C.RESET}    Docker socket, other running containers, internal subnets, live host sweep, pivot tools
+    {C.GREEN}--configs{C.RESET}      Scan config/code files for injection points (SQLi, RCE, LFI, SSTI, XXE, SSRF)
+
+  {C.BOLD}OUTPUT OPTIONS{C.RESET}
+    {C.CYAN}--output{C.RESET}        Show on screen AND save clean copy to timestamped .txt file
+                   Filename: nightowl_<hostname>_<timestamp>.txt
+    {C.CYAN}--no-color{C.RESET}      Disable ANSI colors (useful when piping)
+    {C.CYAN}--help{C.RESET}          Show this help menu
+
+  {C.BOLD}EXAMPLES{C.RESET}
+    {C.GREY}nightowl --all                         # full run, screen only
+    nightowl --all --output                # full run, save to file
+    nightowl --users --sudo --services     # targeted quick checks
+    nightowl --creds --writable            # hunt for PrivEsc paths
+    nightowl --all --no-color | tee out.txt  # manual pipe to file{C.RESET}
+
+  {C.BOLD}OUTPUT KEY{C.RESET}
+    {C.GREEN}[*]{C.RESET}  Informational
+    {C.YELLOW}[+]{C.RESET}  Notable finding — worth investigating
+    {C.RED}[!]{C.RESET}  High-value / likely PrivEsc path
+
+""")
+
+
+# ═════════════════════════════════════════════
+#  MAIN
+# ═════════════════════════════════════════════
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="HTB/CTF Post-Exploitation Enumerator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False   # we handle --help ourselves
+    )
+    p.add_argument("--help",        action="store_true", help="Show help menu")
+    p.add_argument("--all",         action="store_true", help="Run all checks")
+    p.add_argument("--system",      action="store_true", help="System info")
+    p.add_argument("--users",       action="store_true", help="User enumeration")
+    p.add_argument("--groups",      action="store_true", help="Group enumeration")
+    p.add_argument("--sudo",        action="store_true", help="Sudo/SUID/capabilities")
+    p.add_argument("--binaries",    action="store_true", help="Interesting binaries")
+    p.add_argument("--jobs",        action="store_true", help="Cron/scheduled jobs")
+    p.add_argument("--writable",    action="store_true", help="Writable files/dirs")
+    p.add_argument("--services",    action="store_true", help="Services & local ports")
+    p.add_argument("--creds",       action="store_true", help="Credential hunting")
+    p.add_argument("--network",     action="store_true", help="Network info")
+    p.add_argument("--software",    action="store_true", help="Installed software")
+    p.add_argument("--env",         action="store_true", help="Environment variables")
+    p.add_argument("--container",   action="store_true", help="Container escape checks")
+    p.add_argument("--configs",     action="store_true", help="Config & code analysis for injection points")
+    p.add_argument("--no-color",    action="store_true", help="Disable color output")
+    p.add_argument("--output",      action="store_true", help="Save to timestamped file")
+    return p.parse_args()
+
+
+class Tee:
+    """Write to both stdout and a file, stripping ANSI codes for the file."""
+    ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        self.logfile  = open(filepath, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.logfile.write(self.ANSI_ESCAPE.sub("", message))
+
+    def flush(self):
+        self.terminal.flush()
+        self.logfile.flush()
+
+    def close(self):
+        self.logfile.close()
+
+
+def main():
+    args = parse_args()
+
+    # --help: show custom menu and exit
+    if args.help:
+        print_help()
+        sys.exit(0)
+
+    # --output: tee stdout to a timestamped file, strip colors in file
+    log_path = None
+    tee = None
+    if args.output:
+        hostname = socket.gethostname()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = f"nightowl_{hostname}_{timestamp}.txt"
+        tee = Tee(log_path)
+        sys.stdout = tee
+
+    if args.no_color:
+        for attr in dir(C):
+            if not attr.startswith("_"):
+                setattr(C, attr, "")
+
+    banner()
+    print(f"  {C.GREY}Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  "
+          f"Platform: {platform.system()}  |  "
+          f"User: {run('whoami')}{C.RESET}")
+
+    if log_path:
+        print(f"  {C.GREEN}[*]{C.RESET} Saving output to: {C.BOLD}{log_path}{C.RESET}")
+
+    # Build module map
+    MODULE_MAP = {
+        "system":    ("System Info",           enum_system),
+        "users":     ("User Enumeration",      enum_users),
+        "groups":    ("Group Enumeration",     enum_groups),
+        "sudo":      ("Sudo/SUID/Caps",        enum_sudo),
+        "binaries":  ("Interesting Binaries",  enum_interesting_binaries),
+        "jobs":      ("Scheduled Jobs",        enum_jobs),
+        "writable":  ("Writable Paths",        enum_writable),
+        "services":  ("Services & Ports",      enum_services),
+        "creds":     ("Credential Hunting",    enum_credentials),
+        "network":   ("Network Info",          enum_network),
+        "software":  ("Installed Software",    enum_software),
+        "env":       ("Environment",           enum_environment),
+        "container": ("Container Discovery & Pivoting", enum_container),
+        "configs":   ("Config & Code Analysis",         enum_configs),
+    }
+
+    if args.all or not any([
+        args.system, args.users, args.groups, args.sudo, args.binaries,
+        args.jobs, args.writable, args.services, args.creds,
+        args.network, args.software, args.env, args.container, args.configs,
+    ]):
+        # Default: run all
+        to_run = list(MODULE_MAP.keys())
+    else:
+        to_run = [k for k in MODULE_MAP if getattr(args, k, False)]
+
+    checks_run = []
+    for key in to_run:
+        label, fn = MODULE_MAP[key]
+        try:
+            fn()
+            checks_run.append(label)
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}  [!] Interrupted by user — skipping remaining checks{C.RESET}")
+            break
+        except Exception as e:
+            warn(f"Module '{label}' error: {e}")
+
+    print_summary(checks_run)
+
+    if tee:
+        sys.stdout = tee.terminal
+        tee.close()
+        print(f"\n  {C.GREEN}[*]{C.RESET} Report saved → {C.BOLD}{log_path}{C.RESET}\n")
+
+
+if __name__ == "__main__":
+    main()
